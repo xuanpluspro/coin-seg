@@ -63,12 +63,13 @@ def block(cin, cout):
 
 
 class CoinUNet(nn.Module):
-    def __init__(self, pretrained=False):
+    def __init__(self, pretrained=False, dropout=0.0):
         super().__init__()
         self.encoder = resnet18(weights=ResNet18_Weights.DEFAULT if pretrained else None)
         self.encoder.fc = nn.Identity()
         self.decoder = nn.ModuleList(block(a, b) for a, b in
                                      [(768,128),(256,64),(128,32),(96,16)])
+        self.dropout = nn.Dropout2d(dropout)
         self.head = nn.Conv2d(16, 1, 1)
 
     def forward(self, x):
@@ -81,7 +82,7 @@ class CoinUNet(nn.Module):
         for skip, layer in zip((s3, s2, s1, s0), self.decoder):
             z = F.interpolate(z, size=skip.shape[-2:], mode="nearest")
             z = layer(torch.cat((z, skip), dim=1))
-        return F.interpolate(self.head(z), size=x.shape[-2:],
+        return F.interpolate(self.head(self.dropout(z)), size=x.shape[-2:],
                              mode="bilinear", align_corners=False)
 
 
@@ -98,7 +99,14 @@ def run(a):
                           persistent_workers=a.workers > 0)
                for i, d in enumerate((train, val))]
     a.output.mkdir(parents=True, exist_ok=True)
-    model = CoinUNet(a.pretrained).cuda().to(memory_format=torch.channels_last)
+    model = CoinUNet(a.pretrained, a.dropout)
+    if not a.pretrained and not a.from_scratch:
+        path = a.backbone_weights
+        if not path.is_file():
+            raise SystemExit(f"找不到骨干权重：{path}；先运行 download_pretrained.py，或加 --from-scratch")
+        state = torch.load(path, map_location="cpu", weights_only=True)
+        model.encoder.load_state_dict({k: v for k, v in state.items() if not k.startswith("fc.")})
+    model = model.cuda().to(memory_format=torch.channels_last)
     opt = torch.optim.AdamW(model.parameters(), lr=a.lr)
     scaler = torch.amp.GradScaler("cuda")
     mean = torch.tensor([.485,.456,.406], device="cuda")[None,:,None,None]
@@ -172,8 +180,14 @@ if __name__ == "__main__":
     parser.add_argument("--workers", type=int, default=2)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--pretrained", action="store_true", help="使用 ImageNet 权重，首次可能联网")
+    parser.add_argument("--dropout", type=float, default=0.0)
+    init = parser.add_mutually_exclusive_group()
+    init.add_argument("--backbone-weights", type=Path, default=Path("pretrained/resnet18.pth"))
+    init.add_argument("--from-scratch", action="store_true")
+    init.add_argument("--pretrained", action="store_true", help="使用 ImageNet 权重，首次可能联网")
     args = parser.parse_args()
     if min(args.epochs, args.batch_size) < 1 or args.size < 32 or args.size % 32 or args.workers < 0:
         parser.error("轮数和 batch size 必须大于 0，尺寸必须是 32 的正倍数，workers 不能为负")
+    if not 0 <= args.dropout < 1:
+        parser.error("--dropout 必须在 [0, 1) 内")
     run(args)
