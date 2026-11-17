@@ -9,4 +9,6 @@ python -u train.py --epochs 1 --batch-size 2 --output outputs/probe_bs2
 python -u train.py --epochs 30 --batch-size 2 --output outputs/coin_r1
 ```
 
-显存不足时改成 batch size 1。每次使用新的输出目录。默认从头训练；可加 `--pretrained` 使用 ImageNet 权重，首次可能需要联网。输出 `metrics.csv` 和验证前景 IoU 最好的 `best.pth`。
+显存不足时改成 batch size 1。每次使用新的输出目录。默认读取 `pretrained/resnet18.pth`。首次训练前运行 `python download_pretrained.py`，或用 `--backbone-weights` 指定本地官方格式权重。需要随机初始化时加 `--from-scratch`。输出 `metrics.csv` 和验证前景 IoU 最好的 `best.pth`。
+
+Dropout 默认关闭；可加 `--dropout 0.1` 在分割头前启用 Dropout2d，验证时自动关闭。
