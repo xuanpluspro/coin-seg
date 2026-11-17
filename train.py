@@ -3,87 +3,12 @@ import csv
 import random
 from pathlib import Path
 
-import numpy as np
-from PIL import Image
 import torch
-from torch import nn
-from torch.nn import functional as F
-from torch.utils.data import Dataset, DataLoader
-from torchvision.models import resnet18, ResNet18_Weights
+from torch.utils.data import DataLoader
 
-
-class Coins(Dataset):
-    def __init__(self, root, split, size):
-        self.ids = (root / "ImageSets" / f"{split}.txt").read_text(
-            encoding="utf-8-sig").splitlines()
-        self.ids = [s.strip() for s in self.ids if s.strip()]
-        if not self.ids or len(set(self.ids)) != len(self.ids):
-            raise ValueError(f"{split}: 名单为空或有重复")
-        masks, = [p for p in root.iterdir()
-                  if p.is_dir() and p.name.casefold() == "segmentationclass"]
-        images = {}
-        for path in (root / "JPEGImages").iterdir():
-            if path.is_file() and path.suffix.lower() in {".jpg", ".jpeg", ".png"}:
-                if path.stem in images:
-                    raise ValueError(f"重复原图：{path}")
-                images[path.stem] = path
-        self.pairs = [(images[s], masks / f"{s}.png") for s in self.ids]
-        for _, mask in self.pairs:
-            if not mask.is_file():
-                raise FileNotFoundError(mask)
-        self.size = size
-        self.augment = split == "train"
-
-    def __len__(self):
-        return len(self.pairs)
-
-    def __getitem__(self, i):
-        image, mask = self.pairs[i]
-        with Image.open(image) as im, Image.open(mask) as m:
-            if im.size != (self.size, self.size) or m.size != im.size:
-                raise ValueError(f"尺寸不符合要求：{image.name}: {im.size}, {m.size}")
-            x = np.array(im.convert("RGB"))
-            y = np.array(m)
-        if y.ndim != 2 or not ((y == 0) | (y == 1) | (y == 255)).all():
-            raise ValueError(f"掩膜应为单通道二值图：{mask}")
-        x = torch.from_numpy(x).permute(2, 0, 1)
-        y = torch.from_numpy(y != 0).unsqueeze(0)
-        if self.augment:
-            for axis in (-1, -2):
-                if random.random() < 0.5:
-                    x, y = x.flip((axis,)), y.flip((axis,))
-        return x, y
-
-
-def block(cin, cout):
-    return nn.Sequential(nn.Conv2d(cin, cout, 3, padding=1, bias=False),
-                         nn.BatchNorm2d(cout), nn.ReLU(inplace=True),
-                         nn.Conv2d(cout, cout, 3, padding=1, bias=False),
-                         nn.BatchNorm2d(cout), nn.ReLU(inplace=True))
-
-
-class CoinUNet(nn.Module):
-    def __init__(self, pretrained=False, dropout=0.0):
-        super().__init__()
-        self.encoder = resnet18(weights=ResNet18_Weights.DEFAULT if pretrained else None)
-        self.encoder.fc = nn.Identity()
-        self.decoder = nn.ModuleList(block(a, b) for a, b in
-                                     [(768,128),(256,64),(128,32),(96,16)])
-        self.dropout = nn.Dropout2d(dropout)
-        self.head = nn.Conv2d(16, 1, 1)
-
-    def forward(self, x):
-        e = self.encoder
-        s0 = e.relu(e.bn1(e.conv1(x)))
-        s1 = e.layer1(e.maxpool(s0))
-        s2 = e.layer2(s1)
-        s3 = e.layer3(s2)
-        z = e.layer4(s3)
-        for skip, layer in zip((s3, s2, s1, s0), self.decoder):
-            z = F.interpolate(z, size=skip.shape[-2:], mode="nearest")
-            z = layer(torch.cat((z, skip), dim=1))
-        return F.interpolate(self.head(self.dropout(z)), size=x.shape[-2:],
-                             mode="bilinear", align_corners=False)
+from model import CoinUNet
+from utils.dataloader_medical import Coins
+from utils.train_and_eval import evaluate, train_one_epoch
 
 
 def run(a):
@@ -119,48 +44,12 @@ def run(a):
         writer.writerow(["epoch","train_loss","val_loss","foreground_iou",
                          "foreground_dice","area_mae_px","train_peak_gib"])
         for epoch in range(1, a.epochs + 1):
-            losses = []
-            for training, loader in zip((True, False), loaders):
-                model.train(training)
-                if training:
-                    torch.cuda.reset_peak_memory_stats()
-                loss_sum = inter = pred = true = err = 0
-                with torch.set_grad_enabled(training):
-                    for j, (x, y) in enumerate(loader, 1):
-                        x = x.cuda(non_blocking=True).float().div_(255)
-                        x = ((x - mean) / std).contiguous(memory_format=torch.channels_last)
-                        y = y.cuda(non_blocking=True).float()
-                        if training:
-                            opt.zero_grad(set_to_none=True)
-                        with torch.autocast("cuda", dtype=torch.float16):
-                            logits = model(x)
-                        logits = logits.float()
-                        p = logits.sigmoid()
-                        dims = (1,2,3)
-                        loss = F.binary_cross_entropy_with_logits(logits, y) + (
-                            1 - (2*(p*y).sum(dims)+1)/(p.sum(dims)+y.sum(dims)+1)
-                        ).mean()
-                        if training:
-                            scaler.scale(loss).backward()
-                            scaler.step(opt)
-                            scaler.update()
-                        else:
-                            mask = logits > 0
-                            inter += (mask & y.bool()).sum().item()
-                            pred += mask.sum().item()
-                            true += y.sum().item()
-                            err += (mask.sum(dims)-y.sum(dims)).abs().sum().item()
-                        loss_sum += loss.item() * x.size(0)
-                        if training and (j == 1 or j % 20 == 0):
-                            print(f"Epoch {epoch}/{a.epochs} | {j}/{len(loader)} | loss={loss.item():.4f}")
-                losses.append(loss_sum / len(loader.dataset))
-                if training:
-                    peak = torch.cuda.max_memory_allocated() / 2**30
-                    opt.zero_grad(set_to_none=True)
-            union = pred + true - inter
-            iou = inter / union if union else 1.0
-            dice = 2 * inter / (pred + true) if pred + true else 1.0
-            writer.writerow([epoch, *losses, iou, dice, err / len(val), peak])
+            train_loss, peak = train_one_epoch(
+                model, loaders[0], opt, scaler, mean, std, epoch, a.epochs
+            )
+            val_loss, iou, dice, area_mae = evaluate(model, loaders[1], mean, std)
+            losses = (train_loss, val_loss)
+            writer.writerow([epoch, *losses, iou, dice, area_mae, peak])
             file.flush()
             print(f"Epoch {epoch}/{a.epochs} | train={losses[0]:.4f} val={losses[1]:.4f} "
                   f"IoU={iou:.4f} Dice={dice:.4f} | VRAM peak={peak:.2f} GiB")
