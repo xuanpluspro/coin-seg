@@ -1,8 +1,9 @@
-import random
 import numpy as np
 from PIL import Image
 import torch
 from torch.utils.data import Dataset
+
+from .augmentation import augment_train
 
 
 class Coins(Dataset):
@@ -35,16 +36,17 @@ class Coins(Dataset):
         with Image.open(image) as im, Image.open(mask) as m:
             if im.size != (self.size, self.size) or m.size != im.size:
                 raise ValueError(f"尺寸不符合要求：{image.name}: {im.size}, {m.size}")
-            x = np.array(im.convert("RGB"))
-            y = np.array(m)
+            rgb = im.convert("RGB")
+            if self.augment:
+                rgb, m_aug = augment_train(rgb, m)
+            else:
+                m_aug = m
+            x = np.array(rgb)
+            y = np.array(m_aug)
         if y.ndim != 2 or not ((y == 0) | (y == 1) | (y == 255)).all():
             raise ValueError(f"掩膜应为单通道二值图：{mask}")
         x = torch.from_numpy(x).permute(2, 0, 1)
         y = torch.from_numpy(y != 0).unsqueeze(0)
-        if self.augment:
-            for axis in (-1, -2):
-                if random.random() < 0.5:
-                    x, y = x.flip((axis,)), y.flip((axis,))
         return x, y
 
 
